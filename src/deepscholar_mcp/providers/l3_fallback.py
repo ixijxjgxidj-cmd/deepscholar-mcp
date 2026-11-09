@@ -172,11 +172,11 @@ async def fetch_via_cloudflare_browser(
         return None
 
     api_url = (
-        f"https://api.cloudflare.com/client/v4/accounts/{settings.CF_ACCOUNT_ID}"
+        f"https://api.cloudflare.com/client/v4/accounts/{settings.cloudflare_account_id}"
         "/browser-rendering/markdown"
     )
     headers = {
-        "Authorization": f"Bearer {settings.CF_API_TOKEN}",
+        "Authorization": f"Bearer {settings.cloudflare_api_token}",
         "Content-Type": "application/json",
     }
     body = {

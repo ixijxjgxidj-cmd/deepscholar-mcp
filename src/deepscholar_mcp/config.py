@@ -66,6 +66,18 @@ class Settings(BaseSettings):
         return bool(self.ANYSEARCH_API_URL)
 
     @property
+    def cloudflare_account_id(self) -> str | None:
+        """Get Cloudflare Account ID from settings or environment."""
+        import os
+        return self.CF_ACCOUNT_ID or os.environ.get("CLOUDFLARE_ACCOUNT_ID")
+
+    @property
+    def cloudflare_api_token(self) -> str | None:
+        """Get Cloudflare API Token from settings or environment."""
+        import os
+        return self.CF_API_TOKEN or os.environ.get("CLOUDFLARE_API_TOKEN")
+
+    @property
     def has_cloudflare_browser(self) -> bool:
         """Check if Cloudflare Browser Rendering credentials are configured."""
-        return bool(self.CF_ACCOUNT_ID and self.CF_API_TOKEN)
+        return bool(self.cloudflare_account_id and self.cloudflare_api_token)

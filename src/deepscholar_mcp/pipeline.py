@@ -449,13 +449,16 @@ class DeepScholarPipeline:
 
                 async def _fetch_abstract_fallback(p: PaperRecord) -> None:
                     async with sem:
-                        method = "exa_contents"
-                        md = await fetch_via_exa_contents(client, p.url, self.settings)
+                        # Priority 1: Cloudflare Browser Rendering
+                        method = "cloudflare_browser"
+                        md = await fetch_via_cloudflare_browser(
+                            client, p.url, self.settings
+                        )
+                        # Priority 2: Exa Headless Browser Page Scraping Fallback
                         if not md:
-                            method = "cloudflare_browser"
-                            md = await fetch_via_cloudflare_browser(
-                                client, p.url, self.settings
-                            )
+                            method = "exa_contents"
+                            md = await fetch_via_exa_contents(client, p.url, self.settings)
+                        # Priority 3: Jina Reader
                         if not md:
                             method = "jina_reader"
                             md = await fetch_via_jina_reader(
@@ -600,17 +603,18 @@ class DeepScholarPipeline:
                         return md, "ar5iv_html", f"https://ar5iv.labs.arxiv.org/html/{ids.arxiv_id}"
                     else:
                         ar5iv_url = f"https://ar5iv.labs.arxiv.org/html/{ids.arxiv_id}"
-                        # Priority 1b: Exa headless browser page scraping fallback
-                        md = await fetch_via_exa_contents(client, ar5iv_url, self.settings)
-                        if md:
-                            return md, "exa_contents", ar5iv_url
+                        # Priority 1b: Cloudflare browser rendering first
                         md = await fetch_via_cloudflare_browser(client, ar5iv_url, self.settings)
                         if md:
                             return md, "cloudflare_browser", ar5iv_url
-                        else:
-                            md = await fetch_via_jina_reader(client, ar5iv_url, self.settings)
-                            if md:
-                                return md, "jina_reader", ar5iv_url
+                        # Priority 1c: Exa headless browser page scraping fallback
+                        md = await fetch_via_exa_contents(client, ar5iv_url, self.settings)
+                        if md:
+                            return md, "exa_contents", ar5iv_url
+                        # Priority 1d: Jina reader
+                        md = await fetch_via_jina_reader(client, ar5iv_url, self.settings)
+                        if md:
+                            return md, "jina_reader", ar5iv_url
 
                 # Priority 2: Unpaywall Open Access resolution for DOIs
                 if ids.doi and not paper_id_or_url.startswith("http"):
@@ -628,14 +632,14 @@ class DeepScholarPipeline:
                     if md:
                         return md, "pymupdf4llm_pdf", target_url
 
-                # Priority 4: Web / SPA Waterfall (Exa -> Cloudflare -> Jina -> PDF)
-                md = await fetch_via_exa_contents(client, target_url, self.settings)
-                if md:
-                    return md, "exa_contents", target_url
-
+                # Priority 4: Web / SPA Waterfall (Cloudflare Browser -> Exa Browser -> Jina -> PDF)
                 md = await fetch_via_cloudflare_browser(client, target_url, self.settings)
                 if md:
                     return md, "cloudflare_browser", target_url
+
+                md = await fetch_via_exa_contents(client, target_url, self.settings)
+                if md:
+                    return md, "exa_contents", target_url
 
                 md = await fetch_via_jina_reader(client, target_url, self.settings)
                 if md:
