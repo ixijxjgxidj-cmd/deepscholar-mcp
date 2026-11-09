@@ -42,13 +42,16 @@ async def search_exa(
 
     try:
         resp = await client.post(url, headers=headers, json=payload, timeout=8.0)
+        if resp.status_code == 429:
+            logger.warning("Exa search rate-limited (HTTP 429)")
+            return []
         if resp.status_code != 200:
             logger.warning("Exa search error status %d: %s", resp.status_code, resp.text[:200])
             return []
 
         data: dict[str, Any] = resp.json()
         hits: list[RawDiscoveryHit] = []
-        for item in data.get("results", []):
+        for idx, item in enumerate(data.get("results", [])):
             title = item.get("title") or ""
             target_url = item.get("url") or ""
             text = item.get("text") or ""
@@ -63,6 +66,7 @@ async def search_exa(
                     source_engine="exa",
                     published_date=published_date,
                     pre_extracted_ids=pre_ids,
+                    rank=idx,
                 )
             )
         return hits
@@ -104,13 +108,16 @@ async def search_tavily(
 
     try:
         resp = await client.post(url, headers=headers, json=payload, timeout=8.0)
+        if resp.status_code == 429:
+            logger.warning("Tavily search rate-limited (HTTP 429)")
+            return []
         if resp.status_code != 200:
             logger.warning("Tavily search error status %d: %s", resp.status_code, resp.text[:200])
             return []
 
         data: dict[str, Any] = resp.json()
         hits: list[RawDiscoveryHit] = []
-        for item in data.get("results", []):
+        for idx, item in enumerate(data.get("results", [])):
             title = item.get("title") or ""
             target_url = item.get("url") or ""
             snippet = item.get("content") or ""
@@ -123,6 +130,7 @@ async def search_tavily(
                     snippet=snippet,
                     source_engine="tavily",
                     pre_extracted_ids=pre_ids,
+                    rank=idx,
                 )
             )
         return hits
@@ -150,13 +158,16 @@ async def search_serper_scholar(
 
     try:
         resp = await client.post(url, headers=headers, json=payload, timeout=8.0)
+        if resp.status_code == 429:
+            logger.warning("Serper Scholar rate-limited (HTTP 429)")
+            return []
         if resp.status_code != 200:
             logger.warning("Serper Scholar error status %d: %s", resp.status_code, resp.text[:200])
             return []
 
         data: dict[str, Any] = resp.json()
         hits: list[RawDiscoveryHit] = []
-        for item in data.get("organic", []):
+        for idx, item in enumerate(data.get("organic", [])):
             title = item.get("title") or ""
             link = item.get("link") or ""
             snippet = item.get("snippet") or ""
@@ -189,6 +200,7 @@ async def search_serper_scholar(
                     citation_count=citation_count,
                     venue=venue,
                     pre_extracted_ids=pre_ids,
+                    rank=idx,
                 )
             )
         return hits
@@ -231,6 +243,9 @@ async def search_anysearch(
                 timeout=8.0,
             )
 
+        if resp.status_code == 429:
+            logger.warning("AnySearch rate-limited (HTTP 429)")
+            return []
         if resp.status_code != 200:
             logger.warning("AnySearch error status %d", resp.status_code)
             return []
@@ -242,7 +257,7 @@ async def search_anysearch(
             or data.get("hits")
             or []
         )
-        for item in raw_items:
+        for idx, item in enumerate(raw_items):
             title = item.get("title") or ""
             target_url = item.get("url") or item.get("link") or ""
             snippet = item.get("content") or item.get("snippet") or ""
@@ -255,6 +270,7 @@ async def search_anysearch(
                     snippet=snippet,
                     source_engine="anysearch",
                     pre_extracted_ids=pre_ids,
+                    rank=idx,
                 )
             )
         return hits
@@ -279,13 +295,16 @@ async def search_openalex_native(
 
     try:
         resp = await client.get(url, params=params, timeout=10.0)
+        if resp.status_code == 429:
+            logger.warning("OpenAlex native search rate-limited (HTTP 429)")
+            return []
         if resp.status_code != 200:
             logger.warning("OpenAlex search returned status %d", resp.status_code)
             return []
 
         data: dict[str, Any] = resp.json()
         hits: list[RawDiscoveryHit] = []
-        for item in data.get("results", []):
+        for idx, item in enumerate(data.get("results", [])):
             title = item.get("display_name") or item.get("title") or ""
             target_url = item.get("doi") or item.get("id") or ""
             snippet = reconstruct_openalex_abstract(item.get("abstract_inverted_index")) or ""
@@ -331,6 +350,7 @@ async def search_openalex_native(
                     venue=venue,
                     oa_pdf_url=oa_pdf_url,
                     pre_extracted_ids=pre_ids,
+                    rank=idx,
                 )
             )
         return hits
@@ -358,13 +378,16 @@ async def search_s2_native(
 
     try:
         resp = await client.get(url, params=params, headers=headers, timeout=10.0)
+        if resp.status_code == 429:
+            logger.warning("Semantic Scholar native search rate-limited (HTTP 429)")
+            return []
         if resp.status_code != 200:
             logger.warning("Semantic Scholar native search returned status %d", resp.status_code)
             return []
 
         data: dict[str, Any] = resp.json()
         hits: list[RawDiscoveryHit] = []
-        for item in data.get("data", []):
+        for idx, item in enumerate(data.get("data", [])):
             paper_id = item.get("paperId")
             title = item.get("title") or ""
             target_url = item.get("url") or (
@@ -409,6 +432,7 @@ async def search_s2_native(
                     venue=venue,
                     oa_pdf_url=oa_pdf_url,
                     pre_extracted_ids=pre_ids,
+                    rank=idx,
                 )
             )
         return hits
@@ -422,36 +446,91 @@ async def run_l1_discovery(
     query: str,
     limit: int,
     settings: Settings,
+    timeout: float | None = None,
+    provider_statuses: dict[str, str] | None = None,
 ) -> list[RawDiscoveryHit]:
-    """Execute concurrent recall across all configured L1 discovery providers."""
-    tasks = [
-        search_openalex_native(client, query, limit, settings),
-        search_s2_native(client, query, limit, settings),
-    ]
+    """Execute concurrent recall across all configured L1 discovery providers with graceful partial degradation."""
+    task_map: dict[asyncio.Task[list[RawDiscoveryHit]], str] = {
+        asyncio.create_task(
+            search_openalex_native(client, query, limit, settings)
+        ): "openalex_native",
+        asyncio.create_task(
+            search_s2_native(client, query, limit, settings)
+        ): "semantic_scholar_native",
+    }
 
     if settings.has_exa:
-        tasks.append(search_exa(client, query, limit, settings))
+        task_map[
+            asyncio.create_task(search_exa(client, query, limit, settings))
+        ] = "exa"
     if settings.has_tavily:
-        tasks.append(search_tavily(client, query, limit, settings))
+        task_map[
+            asyncio.create_task(search_tavily(client, query, limit, settings))
+        ] = "tavily"
     if settings.has_serper:
-        tasks.append(search_serper_scholar(client, query, limit, settings))
+        task_map[
+            asyncio.create_task(
+                search_serper_scholar(client, query, limit, settings)
+            )
+        ] = "serper_scholar"
     if settings.has_anysearch:
-        tasks.append(search_anysearch(client, query, limit, settings))
+        task_map[
+            asyncio.create_task(search_anysearch(client, query, limit, settings))
+        ] = "anysearch"
 
-    try:
-        results = await asyncio.wait_for(
-            asyncio.gather(*tasks, return_exceptions=True),
-            timeout=settings.L1_TIMEOUT_SEC,
-        )
-    except asyncio.TimeoutError:
-        logger.warning("L1 discovery stage timed out after %.1f seconds", settings.L1_TIMEOUT_SEC)
-        return []
+    stage_timeout = timeout if timeout is not None else settings.L1_TIMEOUT_SEC
+    done, pending = await asyncio.wait(
+        task_map.keys(),
+        timeout=stage_timeout,
+    )
 
     combined_hits: list[RawDiscoveryHit] = []
-    for res in results:
-        if isinstance(res, list):
-            combined_hits.extend(res)
-        elif isinstance(res, Exception):
-            logger.warning("Provider in L1 discovery raised exception: %s", res)
+    statuses: dict[str, str] = {}
+
+    # 1. Harvest hits from completed providers
+    for task in done:
+        provider_name = task_map[task]
+        try:
+            if task.exception() is not None:
+                exc = task.exception()
+                logger.warning(
+                    "Provider '%s' failed with exception: %s",
+                    provider_name,
+                    exc,
+                )
+                statuses[provider_name] = "failed"
+            else:
+                hits = task.result()
+                statuses[provider_name] = "success"
+                combined_hits.extend(hits)
+        except Exception as err:
+            logger.warning(
+                "Error processing result for '%s': %s", provider_name, err
+            )
+            statuses[provider_name] = "failed"
+
+    # 2. Handle timed-out providers by cancelling and recording status
+    for task in pending:
+        provider_name = task_map[task]
+        statuses[provider_name] = "timeout"
+        logger.warning(
+            "Provider '%s' timed out after %.1f seconds; cancelling task.",
+            provider_name,
+            stage_timeout,
+        )
+        task.cancel()
+
+    if pending:
+        # Await cancelled tasks to suppress UnhandledTaskCancellation warnings
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    logger.info(
+        "L1 discovery finished. Statuses: %s. Preserved hits count: %d",
+        statuses,
+        len(combined_hits),
+    )
+
+    if provider_statuses is not None:
+        provider_statuses.update(statuses)
 
     return combined_hits

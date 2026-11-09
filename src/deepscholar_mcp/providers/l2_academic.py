@@ -107,6 +107,7 @@ async def batch_enrich_s2(
                     citation_count=citation_count,
                     influential_citation_count=influential_count,
                     abstract=abstract,
+                    abstract_source="semantic_scholar_batch" if abstract else None,
                     tldr=tldr,
                     identifiers=IdentifierSet(
                         doi=doi,
@@ -229,6 +230,7 @@ async def batch_enrich_openalex(
                     venue=venue,
                     citation_count=citation_count,
                     abstract=abstract,
+                    abstract_source="openalex_batch" if abstract else None,
                     identifiers=ids,
                     url=work.get("doi") or work.get("id") or "",
                     oa_pdf_url=oa_pdf_url,
@@ -324,6 +326,7 @@ async def fetch_arxiv_atom_batch(
                 year=year,
                 venue="arXiv",
                 abstract=summary,
+                abstract_source="arxiv_atom" if summary else None,
                 identifiers=IdentifierSet(doi=doi, arxiv_id=canonical_id),
                 url=f"https://arxiv.org/abs/{canonical_id}",
                 oa_pdf_url=f"https://arxiv.org/pdf/{canonical_id}.pdf",

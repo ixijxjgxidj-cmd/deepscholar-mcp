@@ -49,8 +49,10 @@ DeepScholar-MCP implements a **4-Stage Concurrent Waterfall Architecture** desig
 
 ### Key Principles
 - **Zero-Key Cold-Start Baseline:** Out of the box with zero API keys configured, DeepScholar-MCP provides full academic search and full-text retrieval using **OpenAlex + Semantic Scholar Public + arXiv API + Unpaywall + ar5iv HTML + Jina Reader + PyMuPDF4LLM**.
-- **Graceful Degradation:** Any missing API keys or HTTP failures (`429`, `5xx`, timeouts) trigger structured warnings and smoothly fall back to subsequent tiers.
-- **Hard Timeout Protection:** Each stage is bounded with `asyncio.wait_for` and throttled with `asyncio.Semaphore` so every MCP tool call completes within **35 seconds max**.
+- **Abstract Credibility & Strict Provenance:** Scientifically separates official `abstract` (from verified academic APIs or explicit `## Abstract` sections) from `search_snippet` (search engine snippets) and `extracted_excerpt` (raw web scrape excerpts), preventing AI agents from confusing forum text or navigation bars with author abstracts.
+- **Resilient Multi-Source Timeout & Result Preservation:** Each discovery provider runs as an independent task. If a slow provider times out, all completed providers' results are fully preserved, the slow task is cancelled, and provider statuses (`success`, `timeout`, `rate_limited`, `failed`) are recorded.
+- **Unified 35-Second End-to-End Budget (`TOTAL_TIMEOUT_SEC`):** Enforces a global deadline across the entire waterfall pipeline, dynamically distributing remaining time budgets to L1, L2, and L3 stages.
+- **Multi-Factor Relevance Ranking with RRF:** Eliminates engine-order bias by computing Reciprocal Rank Fusion (RRF) across engines, combined with RapidFuzz title similarity, publication recency, and verified identifier quality. Logarithmic citations serve as an auxiliary signal, ensuring fresh papers are never starved.
 - **Persistent Caching:** Built-in `AsyncSQLiteCache` caches metadata for 7 days and full text for 30 days.
 
 ---
@@ -119,9 +121,10 @@ cp .env.example .env
 | `CF_API_TOKEN` | L3 | Cloudflare API Token for Browser Rendering |
 | `JINA_API_KEY` | L3 | Jina Reader API key (optional for higher rate limits) |
 | `CACHE_DB_PATH` | Cache | Path to SQLite cache file (default: `.deepscholar_cache.sqlite3`) |
+| `TOTAL_TIMEOUT_SEC` | Timeout | Unified end-to-end hard deadline for MCP operations (default: 35.0) |
 | `L1_TIMEOUT_SEC` | Timeout | L1 search discovery timeout (default: 12.0) |
 | `L2_TIMEOUT_SEC` | Timeout | L2 academic metadata enrichment timeout (default: 12.0) |
-| `L3_TIMEOUT_SEC` | Timeout | L3 browser fallback extraction timeout (default: 20.0) |
+| `L3_TIMEOUT_SEC` | Timeout | L3 browser fallback extraction timeout (default: 12.0) |
 | `MAX_CONCURRENT_REQUESTS` | Runtime | Maximum concurrent asynchronous requests (default: 8) |
 | `MAX_FULLTEXT_CHARS` | Runtime | Truncation limit for full-text extraction (default: 35000) |
 

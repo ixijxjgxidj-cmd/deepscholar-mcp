@@ -224,3 +224,211 @@ async def test_scenario_c_closed_access_unpaywall_to_pymupdf(
     assert "Methodology" in result.markdown_content
     assert "single-cell RNA sequencing" in result.markdown_content
     assert result.truncated is False
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_provenance_separation_snippets_and_excerpts(
+    pipeline: DeepScholarPipeline,
+) -> None:
+    """Verify strict provenance: search snippets and unverified web text are never mistaken for author abstracts."""
+    paper_url = "https://forum.openreview.net/forum?id=unstructured_discussion"
+
+    # Mock empty academic API results
+    respx.get("https://api.openalex.org/works").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    respx.get("https://api.semanticscholar.org/graph/v1/paper/search").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+
+    # Mock Exa returning hit with search snippet
+    respx.post("https://api.exa.ai/search").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "title": "Discussion on Hyperparameter Tuning in RL",
+                        "url": paper_url,
+                        "text": "User123 commented: What learning rate did you use for PPO? Reviewer 2 replied...",
+                        "publishedDate": "2026-03-01",
+                    }
+                ]
+            },
+        )
+    )
+
+    # Mock Exa contents returning 404
+    respx.post("https://api.exa.ai/contents").mock(
+        return_value=httpx.Response(404)
+    )
+
+    # Mock Cloudflare returning generic discussion text WITHOUT any Abstract heading
+    cf_url = (
+        f"https://api.cloudflare.com/client/v4/accounts/{pipeline.settings.CF_ACCOUNT_ID}"
+        "/browser-rendering/markdown"
+    )
+    unstructured_web_markdown = (
+        "# Forum Discussion: Tuning PPO in Complex Robotics Tasks\n\n"
+        "Navigation: Home > Forums > Topics > Reinforcement Learning Algorithms\n\n"
+        "Comments and Feedback from Community:\n"
+        "- Alice: I observed policy collapse at step 500k when scaling up batch sizes.\n"
+        "- Bob: Try decreasing the entropy coefficient and tuning the GAE lambda parameter.\n"
+        "- Charlie: Clipping ratio between 0.1 and 0.2 worked best in our benchmark trials."
+    )
+    respx.post(cf_url).mock(
+        return_value=httpx.Response(
+            200,
+            json={"success": True, "result": unstructured_web_markdown},
+        )
+    )
+
+    papers = await pipeline.search_literature(
+        "Hyperparameter Tuning in RL",
+        limit=5,
+        force_browser_fallback_for_missing_abstracts=True,
+    )
+
+    assert len(papers) >= 1
+    target = papers[0]
+    # The official abstract MUST remain None because no trusted academic API or formal abstract section was found!
+    assert target.abstract is None
+    assert target.abstract_source is None
+
+    # The raw search snippet and web excerpt must be cleanly recorded under their separate provenance fields
+    assert target.search_snippet is not None
+    assert "User123 commented" in target.search_snippet
+    assert target.search_snippet_source == "exa"
+
+    assert target.extracted_excerpt is not None
+    assert "Navigation: Home" in target.extracted_excerpt
+    assert target.extracted_excerpt_source == "cloudflare_browser"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_l1_discovery_timeout_preserves_completed_results(
+    pipeline: DeepScholarPipeline,
+) -> None:
+    """Verify that a slow provider timing out does NOT cause all L1 results to be lost."""
+    import asyncio
+
+    from deepscholar_mcp.providers.l1_discovery import run_l1_discovery
+
+    # Mock OpenAlex returning immediately
+    respx.get("https://api.openalex.org/works").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "display_name": "Fast Responding Paper",
+                        "doi": "https://doi.org/10.1000/fast",
+                        "abstract_inverted_index": {"Fast": [0], "results.": [1]},
+                    }
+                ]
+            },
+        )
+    )
+
+    # Mock S2 returning empty immediately
+    respx.get("https://api.semanticscholar.org/graph/v1/paper/search").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+
+    # Mock Exa with a slow delay that will exceed a tight timeout
+    async def _delayed_exa(request):
+        await asyncio.sleep(2.0)
+        return httpx.Response(200, json={"results": []})
+
+    respx.post("https://api.exa.ai/search").mock(side_effect=_delayed_exa)
+
+    async with httpx.AsyncClient() as client:
+        provider_statuses: dict[str, str] = {}
+        hits = await run_l1_discovery(
+            client=client,
+            query="Fast Responding Paper",
+            limit=5,
+            settings=pipeline.settings,
+            timeout=0.3,  # Tight timeout to trigger Exa timeout while OpenAlex finishes
+            provider_statuses=provider_statuses,
+        )
+
+        # Completed OpenAlex hits MUST be preserved and not dropped!
+        assert len(hits) >= 1
+        assert hits[0].title == "Fast Responding Paper"
+
+        # Check provider status tracking
+        assert provider_statuses.get("openalex_native") == "success"
+        assert provider_statuses.get("exa") == "timeout"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_relevance_ranking_rrf_and_recency_over_raw_citations(
+    pipeline: DeepScholarPipeline,
+) -> None:
+    """Verify multi-factor ranking: new relevant paper with multi-engine recall ranks above high-citation irrelevant paper."""
+    query = "Equivariant Diffusion Models for Molecule Generation"
+
+    # Mock OpenAlex returning two papers:
+    # 1. New 2026 exact title match with 0 citations
+    # 2. Old 2005 paper with 20,000 citations on unrelated topic
+    respx.get("https://api.openalex.org/works").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "display_name": "Survey of Classical Data Structures in C++",
+                        "publication_year": 2005,
+                        "cited_by_count": 20000,
+                        "doi": "https://doi.org/10.1000/old_cpp",
+                        "abstract_inverted_index": {"Old": [0]},
+                    },
+                    {
+                        "display_name": "Equivariant Diffusion Models for Molecule Generation",
+                        "publication_year": 2026,
+                        "cited_by_count": 0,
+                        "doi": "https://doi.org/10.1000/new_molecules",
+                        "abstract_inverted_index": {"Molecules": [0]},
+                    },
+                ]
+            },
+        )
+    )
+
+    # Mock Semantic Scholar also finding the 2026 paper (yielding multi-engine RRF consensus!)
+    respx.get("https://api.semanticscholar.org/graph/v1/paper/search").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "paperId": "s2_new_mol",
+                        "title": "Equivariant Diffusion Models for Molecule Generation",
+                        "year": 2026,
+                        "citationCount": 0,
+                        "externalIds": {"DOI": "10.1000/new_molecules"},
+                        "abstract": "We present equivariant diffusion models for 3D molecular graph generation.",
+                    }
+                ]
+            },
+        )
+    )
+
+    respx.post("https://api.exa.ai/search").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+
+    papers = await pipeline.search_literature(query, limit=5)
+
+    assert len(papers) >= 2
+    top_paper = papers[0]
+    # The new relevant paper MUST rank first despite having 0 citations compared to 20,000!
+    assert "Equivariant Diffusion Models" in top_paper.title
+    assert top_paper.year == 2026
+    assert top_paper.relevance_score is not None
+    assert top_paper.relevance_score > papers[1].relevance_score
+

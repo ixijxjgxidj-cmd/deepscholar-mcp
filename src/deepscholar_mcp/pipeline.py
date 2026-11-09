@@ -2,7 +2,9 @@
 
 import asyncio
 import logging
+import math
 import re
+import time
 from typing import Any, Literal
 
 import httpx
@@ -19,6 +21,7 @@ from deepscholar_mcp.providers.l2_academic import (
     resolve_unpaywall_oa,
 )
 from deepscholar_mcp.providers.l3_fallback import (
+    extract_abstract_section,
     fetch_and_parse_pdf,
     fetch_ar5iv_html_markdown,
     fetch_via_cloudflare_browser,
@@ -33,6 +36,116 @@ from deepscholar_mcp.resolver import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class TimeBudget:
+    """Manages end-to-end deadline and dynamically budgets stage timeouts."""
+
+    def __init__(self, total_seconds: float = 35.0) -> None:
+        self.start_time = time.monotonic()
+        self.total_seconds = total_seconds
+        self.deadline = self.start_time + total_seconds
+
+    @property
+    def remaining(self) -> float:
+        return max(0.0, self.deadline - time.monotonic())
+
+    def stage_timeout(self, requested: float) -> float:
+        """Allocate stage timeout ensuring at least a buffer for subsequent stages."""
+        rem = self.remaining
+        if rem <= 1.0:
+            return 0.5
+        return max(0.5, min(requested, rem - 0.5))
+
+    @property
+    def is_exhausted(self) -> bool:
+        return self.remaining <= 1.5
+
+
+def compute_rrf_for_paper(
+    paper: PaperRecord,
+    engine_ranks: dict[str, list[str]],
+) -> float:
+    """Compute Reciprocal Rank Fusion (RRF) score across search engines."""
+    paper_keys: set[str] = set()
+    if paper.identifiers.doi:
+        paper_keys.add(f"doi:{paper.identifiers.doi.lower()}")
+    if paper.identifiers.arxiv_id:
+        paper_keys.add(f"arxiv:{paper.identifiers.arxiv_id.lower()}")
+    title_norm = clean_academic_title(paper.title).lower()
+    if title_norm:
+        paper_keys.add(f"title:{title_norm}")
+
+    raw_rrf = 0.0
+    k_constant = 60.0
+
+    for _engine, ranked_keys in engine_ranks.items():
+        matched_rank: int | None = None
+        for rank_idx, key in enumerate(ranked_keys):
+            if key in paper_keys:
+                matched_rank = rank_idx + 1  # 1-based rank
+                break
+            if key.startswith("title:") and title_norm:
+                engine_title = key[6:]
+                if fuzz.ratio(title_norm, engine_title) >= 90:
+                    matched_rank = rank_idx + 1
+                    break
+        if matched_rank is not None:
+            raw_rrf += 1.0 / (k_constant + matched_rank)
+
+    # Scale RRF so a single rank-1 hit gives ~1.0
+    return raw_rrf * 60.0
+
+
+def compute_paper_relevance(
+    paper: PaperRecord,
+    query: str,
+    rrf_score: float,
+) -> float:
+    """Compute multi-factor composite relevance score.
+
+    Combines:
+    - Title lexical similarity (35% weight)
+    - Multi-engine RRF score (30% weight)
+    - Source quality / verified identifier (15% weight)
+    - Recency / publication freshness (10% weight)
+    - Logarithmic citations as mild auxiliary signal (10% weight)
+    """
+    # 1. Title Similarity (0.0 - 1.0)
+    norm_title = clean_academic_title(paper.title).lower()
+    norm_query = query.lower().strip()
+    title_sim = fuzz.token_set_ratio(norm_query, norm_title) / 100.0
+
+    # 2. Recency Signal (0.0 - 1.0)
+    current_year = 2026
+    if paper.year is not None:
+        recency = max(0.0, min(1.0, 1.0 - (current_year - paper.year) / 20.0))
+    else:
+        recency = 0.5
+
+    # 3. Source Quality / Verification Signal (0.0 - 1.0)
+    quality = 0.5
+    if paper.identifiers.doi or paper.identifiers.arxiv_id:
+        quality = 1.0
+    elif paper.source_tier == "L2_Academic_API":
+        quality = 0.85
+    elif paper.venue and len(paper.venue.strip()) > 3:
+        quality = 0.70
+
+    # 4. Logarithmic Citation Signal (0.0 - 1.0) - strictly avoiding starvation of new papers
+    cite_score = 0.0
+    if paper.citation_count is not None and paper.citation_count > 0:
+        cite_score = min(1.0, math.log1p(paper.citation_count) / math.log(10001))
+
+    # Composite weighted formula
+    composite = (
+        0.35 * title_sim
+        + 0.30 * min(1.0, rrf_score)
+        + 0.15 * quality
+        + 0.10 * recency
+        + 0.10 * cite_score
+    )
+    return round(composite, 4)
 
 
 class DeepScholarPipeline:
@@ -54,14 +167,37 @@ class DeepScholarPipeline:
         force_browser_fallback_for_missing_abstracts: bool = True,
     ) -> list[PaperRecord]:
         """Execute 4-stage literature search: Discovery -> Alignment -> Enrichment -> Fallback."""
+        budget = TimeBudget(total_seconds=self.settings.TOTAL_TIMEOUT_SEC)
+
         async with httpx.AsyncClient(
             headers={"User-Agent": "DeepScholar-MCP/1.0"},
             follow_redirects=True,
         ) as client:
-            # 1. Stage 1: L1 Deep Discovery
+            # 1. Stage 1: L1 Deep Discovery with individual task tracking and deadline
+            l1_timeout = budget.stage_timeout(self.settings.L1_TIMEOUT_SEC)
+            provider_statuses: dict[str, str] = {}
             raw_hits: list[RawDiscoveryHit] = await run_l1_discovery(
-                client, query, limit * 2, self.settings
+                client,
+                query,
+                limit * 2,
+                self.settings,
+                timeout=l1_timeout,
+                provider_statuses=provider_statuses,
             )
+
+            # Build engine rank index for RRF
+            raw_hits_by_engine: dict[str, list[str]] = {}
+            for hit in raw_hits:
+                eng = hit.source_engine
+                if eng not in raw_hits_by_engine:
+                    raw_hits_by_engine[eng] = []
+                if hit.pre_extracted_ids.doi:
+                    k = f"doi:{hit.pre_extracted_ids.doi.lower()}"
+                elif hit.pre_extracted_ids.arxiv_id:
+                    k = f"arxiv:{hit.pre_extracted_ids.arxiv_id.lower()}"
+                else:
+                    k = f"title:{clean_academic_title(hit.title).lower()}"
+                raw_hits_by_engine[eng].append(k)
 
             # 2. Stage 2: Identifier Extraction
             for hit in raw_hits:
@@ -75,8 +211,10 @@ class DeepScholarPipeline:
 
             # Align top unresolved hits (missing both DOI and arXiv ID) via OpenAlex title matching
             unresolved = [
-                h for h in raw_hits
-                if not h.pre_extracted_ids.doi and not h.pre_extracted_ids.arxiv_id
+                h
+                for h in raw_hits
+                if not h.pre_extracted_ids.doi
+                and not h.pre_extracted_ids.arxiv_id
             ][:8]
 
             sem = asyncio.Semaphore(self.settings.MAX_CONCURRENT_REQUESTS)
@@ -90,14 +228,28 @@ class DeepScholarPipeline:
                         if aligned_ids.doi:
                             hit_item.pre_extracted_ids.doi = aligned_ids.doi
                         if aligned_ids.arxiv_id:
-                            hit_item.pre_extracted_ids.arxiv_id = aligned_ids.arxiv_id
+                            hit_item.pre_extracted_ids.arxiv_id = (
+                                aligned_ids.arxiv_id
+                            )
                         if aligned_ids.pmid:
                             hit_item.pre_extracted_ids.pmid = aligned_ids.pmid
                         if aligned_ids.openalex_id:
-                            hit_item.pre_extracted_ids.openalex_id = aligned_ids.openalex_id
+                            hit_item.pre_extracted_ids.openalex_id = (
+                                aligned_ids.openalex_id
+                            )
 
-            if unresolved:
-                await asyncio.gather(*[_align_hit(h) for h in unresolved], return_exceptions=True)
+            if unresolved and not budget.is_exhausted:
+                align_timeout = budget.stage_timeout(6.0)
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            *[_align_hit(h) for h in unresolved],
+                            return_exceptions=True,
+                        ),
+                        timeout=align_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("Title alignment stage timed out")
 
             # 3. Stage 3: Cache lookup and L2 Academic Batch Enrichment
             s2_lookups: list[str] = []
@@ -131,27 +283,36 @@ class DeepScholarPipeline:
                 if aid:
                     arxiv_ids.append(aid)
 
-            # Concurrently execute L2 batch enrichments
+            # Concurrently execute L2 batch enrichments with dynamic budget
+            l2_timeout = budget.stage_timeout(self.settings.L2_TIMEOUT_SEC)
             enrich_tasks = []
             if s2_lookups:
-                enrich_tasks.append(batch_enrich_s2(client, s2_lookups, self.settings))
+                enrich_tasks.append(
+                    batch_enrich_s2(client, s2_lookups, self.settings)
+                )
             else:
                 enrich_tasks.append(asyncio.sleep(0, result={}))
 
             if openalex_dois:
-                enrich_tasks.append(batch_enrich_openalex(client, openalex_dois, self.settings))
+                enrich_tasks.append(
+                    batch_enrich_openalex(
+                        client, openalex_dois, self.settings
+                    )
+                )
             else:
                 enrich_tasks.append(asyncio.sleep(0, result={}))
 
             if arxiv_ids:
-                enrich_tasks.append(fetch_arxiv_atom_batch(client, arxiv_ids))
+                enrich_tasks.append(
+                    fetch_arxiv_atom_batch(client, arxiv_ids)
+                )
             else:
                 enrich_tasks.append(asyncio.sleep(0, result={}))
 
             try:
                 l2_results = await asyncio.wait_for(
                     asyncio.gather(*enrich_tasks, return_exceptions=True),
-                    timeout=self.settings.L2_TIMEOUT_SEC,
+                    timeout=l2_timeout,
                 )
                 s2_map: dict[str, PaperRecord] = (
                     l2_results[0] if isinstance(l2_results[0], dict) else {}
@@ -166,7 +327,7 @@ class DeepScholarPipeline:
                 logger.warning("L2 enrichment stage timed out")
                 s2_map, openalex_map, arxiv_map = {}, {}, {}
 
-            # Synthesize hits into candidate PaperRecords
+            # Synthesize hits into candidate PaperRecords with strict provenance separation
             consolidated: list[PaperRecord] = []
             for hit in raw_hits:
                 doi = hit.pre_extracted_ids.doi
@@ -195,18 +356,40 @@ class DeepScholarPipeline:
                     matched_rec = arxiv_map[aid]
 
                 if matched_rec:
-                    # Merge any extra metadata from OpenAlex or arXiv if complementary
-                    if (not matched_rec.abstract or len(matched_rec.abstract) < 80) and doi and doi in openalex_map:
+                    # Complement with OpenAlex if abstract missing
+                    if (
+                        (not matched_rec.abstract or len(matched_rec.abstract) < 80)
+                        and doi
+                        and doi in openalex_map
+                    ):
                         oa_rec = openalex_map[doi]
                         if oa_rec.abstract:
                             matched_rec.abstract = oa_rec.abstract
+                            matched_rec.abstract_source = "openalex_batch"
                             matched_rec.resolved_via.extend(["openalex_batch"])
                     if not matched_rec.oa_pdf_url and doi and doi in openalex_map:
                         matched_rec.oa_pdf_url = openalex_map[doi].oa_pdf_url
                     consolidated.append(matched_rec)
                 else:
-                    # Fall back to L1 snippet
+                    # Fall back to L1 hit - carefully separating real abstract from search snippet
                     clean_title = clean_academic_title(hit.title)
+                    is_academic_native = hit.source_engine in (
+                        "openalex_native",
+                        "semantic_scholar_native",
+                    )
+
+                    official_abstract = None
+                    official_abstract_source = None
+                    search_snip = None
+                    search_snip_source = None
+
+                    if is_academic_native and len(hit.snippet.strip()) >= 40:
+                        official_abstract = hit.snippet.strip()
+                        official_abstract_source = hit.source_engine
+                    elif len(hit.snippet.strip()) > 0:
+                        search_snip = hit.snippet.strip()
+                        search_snip_source = hit.source_engine
+
                     consolidated.append(
                         PaperRecord(
                             title=clean_title,
@@ -214,7 +397,10 @@ class DeepScholarPipeline:
                             year=hit.year,
                             venue=hit.venue,
                             citation_count=hit.citation_count,
-                            abstract=hit.snippet if len(hit.snippet) >= 40 else None,
+                            abstract=official_abstract,
+                            abstract_source=official_abstract_source,
+                            search_snippet=search_snip,
+                            search_snippet_source=search_snip_source,
                             identifiers=hit.pre_extracted_ids,
                             url=hit.url,
                             oa_pdf_url=hit.oa_pdf_url,
@@ -224,49 +410,96 @@ class DeepScholarPipeline:
                     )
 
             # Unpaywall Open Access resolution for DOIs missing OA PDF
-            missing_oa = [p for p in consolidated if p.identifiers.doi and not p.oa_pdf_url]
-            if missing_oa:
+            missing_oa = [
+                p for p in consolidated if p.identifiers.doi and not p.oa_pdf_url
+            ]
+            if missing_oa and not budget.is_exhausted:
                 async def _resolve_oa(p: PaperRecord) -> None:
                     async with sem:
                         if p.identifiers.doi:
-                            oa_url = await resolve_unpaywall_oa(client, p.identifiers.doi, self.settings)
+                            oa_url = await resolve_unpaywall_oa(
+                                client, p.identifiers.doi, self.settings
+                            )
                             if oa_url:
                                 p.oa_pdf_url = oa_url
                                 p.resolved_via.append("unpaywall_oa")
 
-                await asyncio.gather(*[_resolve_oa(p) for p in missing_oa], return_exceptions=True)
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            *[_resolve_oa(p) for p in missing_oa],
+                            return_exceptions=True,
+                        ),
+                        timeout=budget.stage_timeout(5.0),
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("OA resolution stage timed out")
 
-            # Stage 4: L3 Fallback for missing abstracts if requested
-            if force_browser_fallback_for_missing_abstracts:
+            # Stage 4: L3 Fallback for missing abstracts if requested and budget permits
+            if force_browser_fallback_for_missing_abstracts and not budget.is_exhausted:
                 missing_abstracts = [
-                    p for p in consolidated
+                    p
+                    for p in consolidated
                     if (not p.abstract or len(p.abstract.strip()) < 80)
                     and p.url
                     and p.url.startswith("http")
                 ][:4]
 
+                l3_timeout = budget.stage_timeout(self.settings.L3_TIMEOUT_SEC)
+
                 async def _fetch_abstract_fallback(p: PaperRecord) -> None:
                     async with sem:
+                        method = "exa_contents"
                         md = await fetch_via_exa_contents(client, p.url, self.settings)
                         if not md:
-                            md = await fetch_via_cloudflare_browser(client, p.url, self.settings)
+                            method = "cloudflare_browser"
+                            md = await fetch_via_cloudflare_browser(
+                                client, p.url, self.settings
+                            )
                         if not md:
-                            md = await fetch_via_jina_reader(client, p.url, self.settings)
+                            method = "jina_reader"
+                            md = await fetch_via_jina_reader(
+                                client, p.url, self.settings
+                            )
 
                         if md:
-                            # Clean and take first 1500 chars as abstract
-                            cleaned_md = re.sub(r"\s+", " ", md).strip()
-                            p.abstract = cleaned_md[:1500]
+                            # Verify if a formal abstract section can be identified
+                            formal_abstract = extract_abstract_section(md)
+                            if formal_abstract:
+                                p.abstract = formal_abstract
+                                p.abstract_source = f"{method}_abstract_section"
+                            else:
+                                # Safe separation: record as extracted excerpt instead of posing as official abstract
+                                cleaned_md = re.sub(r"\s+", " ", md).strip()
+                                p.extracted_excerpt = cleaned_md[:1500]
+                                p.extracted_excerpt_source = method
+
                             p.source_tier = "L3_Browser_Fallback"
                             p.resolved_via.append("l3_browser_fallback")
 
                 if missing_abstracts:
-                    await asyncio.gather(
-                        *[_fetch_abstract_fallback(p) for p in missing_abstracts],
-                        return_exceptions=True,
-                    )
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(
+                                *[_fetch_abstract_fallback(p) for p in missing_abstracts],
+                                return_exceptions=True,
+                            ),
+                            timeout=l3_timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning("L3 browser fallback stage timed out")
 
-            # 8. Deduplication by canonical DOI -> arXiv ID -> Normalized Title
+            # Calculate composite relevance scores using RRF, title match, recency, quality, citations
+            for p in consolidated:
+                rrf_val = compute_rrf_for_paper(p, raw_hits_by_engine)
+                p.relevance_score = compute_paper_relevance(p, query, rrf_val)
+
+            # Sort candidate papers by composite relevance score descending BEFORE deduplication
+            consolidated.sort(
+                key=lambda item: (item.relevance_score or 0.0), reverse=True
+            )
+
+            # Deduplication: retain the highest relevance score instance for each unique entity
             seen_dois: set[str] = set()
             seen_arxiv: set[str] = set()
             seen_titles: list[tuple[str, PaperRecord]] = []
@@ -286,7 +519,6 @@ class DeepScholarPipeline:
                         continue
                     seen_arxiv.add(aid)
                 else:
-                    # Check fuzzy title similarity against already accepted records
                     is_dup = False
                     for existing_title, _ in seen_titles:
                         if fuzz.ratio(norm_title, existing_title) >= 90:
@@ -298,11 +530,10 @@ class DeepScholarPipeline:
                 seen_titles.append((norm_title, p))
                 deduped.append(p)
 
-            # 9. Apply year_from filter
+            # Apply optional minimum publication year filter
             if year_from is not None:
                 deduped = [
-                    p for p in deduped
-                    if p.year is None or p.year >= year_from
+                    p for p in deduped if p.year is None or p.year >= year_from
                 ]
 
             # Cache enriched records
@@ -328,7 +559,7 @@ class DeepScholarPipeline:
         sections: list[str] | None = None,
         max_chars: int = 35000,
     ) -> FullTextResult:
-        """Retrieve complete academic Markdown text via 4-tier fallback extraction."""
+        """Retrieve complete academic Markdown text via 4-tier fallback extraction within end-to-end deadline."""
         cache_key = f"fulltext:{paper_id_or_url.strip()}"
         cached_md = await self.cache.get_text(cache_key)
 
@@ -347,11 +578,10 @@ class DeepScholarPipeline:
             raw_markdown = cached_md
             extraction_method = "jina_reader"  # general marker for cached content
         else:
+            budget = TimeBudget(total_seconds=self.settings.TOTAL_TIMEOUT_SEC)
             ids = extract_identifiers(paper_id_or_url, paper_id_or_url)
-            async with httpx.AsyncClient(
-                headers={"User-Agent": "DeepScholar-MCP/1.0"},
-                follow_redirects=True,
-            ) as client:
+
+            async def _execute_waterfall(client: httpx.AsyncClient) -> tuple[str | None, str, str]:
                 target_url = paper_id_or_url
                 if not target_url.startswith("http"):
                     if ids.arxiv_id:
@@ -359,80 +589,83 @@ class DeepScholarPipeline:
                     elif ids.doi:
                         target_url = f"https://doi.org/{ids.doi}"
 
+                md_res = None
+                method_res = "failed"
+                url_res = target_url
+
                 # Priority 1: arXiv HTML rewriting & parsing
                 if ids.arxiv_id:
                     md = await fetch_ar5iv_html_markdown(client, ids.arxiv_id)
                     if md:
-                        raw_markdown = md
-                        extraction_method = "ar5iv_html"
-                        resolved_url = f"https://ar5iv.labs.arxiv.org/html/{ids.arxiv_id}"
+                        return md, "ar5iv_html", f"https://ar5iv.labs.arxiv.org/html/{ids.arxiv_id}"
                     else:
                         ar5iv_url = f"https://ar5iv.labs.arxiv.org/html/{ids.arxiv_id}"
                         md = await fetch_via_cloudflare_browser(client, ar5iv_url, self.settings)
                         if md:
-                            raw_markdown = md
-                            extraction_method = "cloudflare_browser"
-                            resolved_url = ar5iv_url
+                            return md, "cloudflare_browser", ar5iv_url
                         else:
                             md = await fetch_via_jina_reader(client, ar5iv_url, self.settings)
                             if md:
-                                raw_markdown = md
-                                extraction_method = "jina_reader"
-                                resolved_url = ar5iv_url
+                                return md, "jina_reader", ar5iv_url
 
                 # Priority 2: Unpaywall Open Access resolution for DOIs
-                if not raw_markdown and ids.doi and not paper_id_or_url.startswith("http"):
+                if ids.doi and not paper_id_or_url.startswith("http"):
                     oa_url = await resolve_unpaywall_oa(client, ids.doi, self.settings)
                     if oa_url:
                         target_url = oa_url
+                        url_res = target_url
 
                 # Priority 3: Direct PDF parsing
-                if not raw_markdown and (
+                if (
                     target_url.lower().endswith(".pdf")
                     or "arxiv.org/pdf" in target_url.lower()
                 ):
                     md = await fetch_and_parse_pdf(client, target_url)
                     if md:
-                        raw_markdown = md
-                        extraction_method = "pymupdf4llm_pdf"
-                        resolved_url = target_url
+                        return md, "pymupdf4llm_pdf", target_url
 
                 # Priority 4: Web / SPA Waterfall (Exa -> Cloudflare -> Jina -> PDF)
-                if not raw_markdown:
-                    md = await fetch_via_exa_contents(client, target_url, self.settings)
-                    if md:
-                        raw_markdown = md
-                        extraction_method = "exa_contents"
-                        resolved_url = target_url
-                    else:
-                        md = await fetch_via_cloudflare_browser(client, target_url, self.settings)
-                        if md:
-                            raw_markdown = md
-                            extraction_method = "cloudflare_browser"
-                            resolved_url = target_url
-                        else:
-                            md = await fetch_via_jina_reader(client, target_url, self.settings)
-                            if md:
-                                raw_markdown = md
-                                extraction_method = "jina_reader"
-                                resolved_url = target_url
-                            else:
-                                # Final attempt: try parsing as PDF stream
-                                md = await fetch_and_parse_pdf(client, target_url)
-                                if md:
-                                    raw_markdown = md
-                                    extraction_method = "pymupdf4llm_pdf"
-                                    resolved_url = target_url
+                md = await fetch_via_exa_contents(client, target_url, self.settings)
+                if md:
+                    return md, "exa_contents", target_url
 
-                if raw_markdown:
-                    await self.cache.set_text(
-                        cache_key, raw_markdown, ttl=self.cache.FULLTEXT_TTL
+                md = await fetch_via_cloudflare_browser(client, target_url, self.settings)
+                if md:
+                    return md, "cloudflare_browser", target_url
+
+                md = await fetch_via_jina_reader(client, target_url, self.settings)
+                if md:
+                    return md, "jina_reader", target_url
+
+                md = await fetch_and_parse_pdf(client, target_url)
+                if md:
+                    return md, "pymupdf4llm_pdf", target_url
+
+                return md_res, method_res, url_res
+
+            async with httpx.AsyncClient(
+                headers={"User-Agent": "DeepScholar-MCP/1.0"},
+                follow_redirects=True,
+            ) as client:
+                try:
+                    raw_markdown, extraction_method, resolved_url = await asyncio.wait_for(
+                        _execute_waterfall(client),
+                        timeout=budget.remaining,
                     )
-                else:
-                    raw_markdown = (
-                        f"# Full-Text Retrieval Failed\n\nCould not extract full text for: {paper_id_or_url}"
-                    )
+                except asyncio.TimeoutError:
+                    logger.warning("Full-text extraction timed out after %.1f seconds", self.settings.TOTAL_TIMEOUT_SEC)
+                    raw_markdown = None
                     extraction_method = "failed"
+
+            if raw_markdown:
+                await self.cache.set_text(
+                    cache_key, raw_markdown, ttl=self.cache.FULLTEXT_TTL
+                )
+            else:
+                raw_markdown = (
+                    f"# Full-Text Retrieval Failed\n\nCould not extract full text for: {paper_id_or_url}"
+                )
+                extraction_method = "failed"
 
         # Apply section slicing and length constraints
         available_sections, sliced_content, truncated = slice_markdown_sections(

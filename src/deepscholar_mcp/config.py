@@ -32,9 +32,10 @@ class Settings(BaseSettings):
 
     # === Runtime, Cache & Timeout Settings ===
     CACHE_DB_PATH: str = ".deepscholar_cache.sqlite3"
+    TOTAL_TIMEOUT_SEC: float = 35.0  # Unified end-to-end hard deadline for MCP operations
     L1_TIMEOUT_SEC: float = 12.0
     L2_TIMEOUT_SEC: float = 12.0
-    L3_TIMEOUT_SEC: float = 20.0
+    L3_TIMEOUT_SEC: float = 12.0
     MAX_CONCURRENT_REQUESTS: int = 8
     MAX_FULLTEXT_CHARS: int = 35000
 

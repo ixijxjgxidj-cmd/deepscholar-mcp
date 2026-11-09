@@ -54,6 +54,7 @@ class RawDiscoveryHit(BaseModel):
     citation_count: int | None = None
     venue: str | None = None
     oa_pdf_url: str | None = None
+    rank: int = 0
 
 
 class PaperRecord(BaseModel):
@@ -65,8 +66,22 @@ class PaperRecord(BaseModel):
     venue: str | None = None
     citation_count: int | None = None
     influential_citation_count: int | None = None
+
+    # Official author abstract from trusted academic APIs or explicit abstract sections
     abstract: str | None = None
+    abstract_source: str | None = None
     tldr: str | None = None
+
+    # Search engine snippet (distinct from official abstract)
+    search_snippet: str | None = None
+    search_snippet_source: str | None = None
+
+    # Web extraction excerpt (fallback when no formal abstract section could be verified)
+    extracted_excerpt: str | None = None
+    extracted_excerpt_source: str | None = None
+
+    # Relevance and provenance metadata
+    relevance_score: float | None = None
     identifiers: IdentifierSet = Field(default_factory=IdentifierSet)
     url: str
     oa_pdf_url: str | None = None

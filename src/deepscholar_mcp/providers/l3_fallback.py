@@ -16,6 +16,23 @@ from deepscholar_mcp.resolver import extract_identifiers
 logger = logging.getLogger(__name__)
 
 HEADING_REGEX = re.compile(r"^(#{1,4})\s+(.+)$")
+ABSTRACT_SECTION_PATTERN = re.compile(
+    r"(?:^|\n)(?:#{1,4}\s+|\*\*)(?:Abstract|ABSTRACT|Summary|Overview)(?:\*\*)?[:\s]*\n+([\s\S]+?)(?=\n+#|\n+\*\*|\Z)",
+    re.IGNORECASE,
+)
+
+
+def extract_abstract_section(markdown_text: str) -> str | None:
+    """Extract official abstract text if an explicit abstract section exists in Markdown."""
+    if not markdown_text:
+        return None
+    match = ABSTRACT_SECTION_PATTERN.search(markdown_text)
+    if match:
+        extracted = match.group(1).strip()
+        cleaned = re.sub(r"\s+", " ", extracted).strip()
+        if len(cleaned) >= 60:
+            return cleaned
+    return None
 
 
 def rewrite_to_ar5iv_url(url_or_id: str, arxiv_id: str | None = None) -> str | None:
@@ -126,7 +143,7 @@ async def fetch_via_exa_contents(
         results = data.get("results", [])
         if results and isinstance(results[0], dict) and results[0].get("text"):
             text = results[0]["text"].strip()
-            if len(text) >= 200:
+            if len(text) >= 80:
                 return text
         return None
     except Exception as exc:
@@ -162,7 +179,7 @@ async def fetch_via_cloudflare_browser(
             data: dict[str, Any] = resp.json()
             if data.get("success") is True and data.get("result"):
                 result_text = str(data["result"]).strip()
-                if len(result_text) >= 200:
+                if len(result_text) >= 80:
                     return result_text
         else:
             logger.warning("Cloudflare browser error %d: %s", resp.status_code, resp.text[:200])
@@ -191,7 +208,7 @@ async def fetch_via_jina_reader(
         resp = await client.get(reader_url, headers=headers, timeout=18.0)
         if resp.status_code == 200:
             text = resp.text.strip()
-            if len(text) >= 200:
+            if len(text) >= 80:
                 return text
         return None
     except Exception as exc:
