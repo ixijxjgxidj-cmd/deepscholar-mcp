@@ -21,6 +21,7 @@ class Settings(BaseSettings):
 
     # === L2: Academic Metadata & Open Access APIs ===
     S2_API_KEY: str | None = None
+    OPENALEX_API_KEY: str | None = None
     OPENALEX_EMAIL: str = "researcher@example.com"
     UNPAYWALL_EMAIL: str = "researcher@example.com"
     CORE_API_KEY: str | None = None
@@ -53,6 +54,11 @@ class Settings(BaseSettings):
     def has_serper(self) -> bool:
         """Check if Serper API credentials are configured."""
         return bool(self.SERPER_API_KEY)
+
+    @property
+    def has_core(self) -> bool:
+        """Check if CORE API credentials are configured."""
+        return bool(self.CORE_API_KEY)
 
     @property
     def has_anysearch(self) -> bool:

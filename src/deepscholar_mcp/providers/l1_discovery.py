@@ -303,6 +303,8 @@ async def search_openalex_native(
         "per-page": limit,
         "mailto": settings.OPENALEX_EMAIL,
     }
+    if settings.OPENALEX_API_KEY:
+        params["api_key"] = settings.OPENALEX_API_KEY
 
     try:
         resp = await client.get(url, params=params, timeout=10.0)
@@ -527,6 +529,76 @@ async def search_arxiv_native(
         return []
 
 
+async def search_core(
+    client: httpx.AsyncClient,
+    query: str,
+    limit: int,
+    settings: Settings,
+) -> list[RawDiscoveryHit]:
+    """Query CORE academic API for global Open Access research."""
+    if not settings.has_core:
+        return []
+
+    url = "https://api.core.ac.uk/v3/search/works"
+    headers = {
+        "Authorization": f"Bearer {settings.CORE_API_KEY}",
+        "User-Agent": "DeepScholar-MCP/1.0",
+    }
+    params = {"q": query, "limit": limit}
+
+    try:
+        resp = await client.get(url, headers=headers, params=params, timeout=8.0)
+        if resp.status_code == 429:
+            raise ProviderRateLimitedError("CORE API rate-limited (HTTP 429)")
+        if resp.status_code != 200:
+            logger.warning("CORE API returned status %d", resp.status_code)
+            return []
+
+        data: dict[str, Any] = resp.json()
+        hits: list[RawDiscoveryHit] = []
+        for idx, item in enumerate(data.get("results", [])):
+            if not isinstance(item, dict):
+                continue
+            title = clean_academic_title(item.get("title") or "")
+            if not title:
+                continue
+
+            authors = [
+                a.get("name")
+                for a in item.get("authors", [])
+                if isinstance(a, dict) and a.get("name")
+            ]
+            doi = item.get("doi")
+            if doi:
+                doi = doi.strip().lower()
+
+            url_hit = item.get("downloadUrl") or (
+                f"https://doi.org/{doi}" if doi else ""
+            )
+            abstract = item.get("abstract") or ""
+            year = item.get("yearPublished")
+
+            hits.append(
+                RawDiscoveryHit(
+                    title=title,
+                    url=url_hit or f"https://core.ac.uk/works/{item.get('id')}",
+                    snippet=abstract,
+                    source_engine="core_academic",
+                    authors=authors,
+                    year=year,
+                    oa_pdf_url=item.get("downloadUrl"),
+                    pre_extracted_ids=IdentifierSet(doi=doi),
+                    rank=idx,
+                )
+            )
+        return hits
+    except ProviderRateLimitedError:
+        raise
+    except Exception as exc:
+        logger.warning("CORE search failed: %s", exc)
+        return []
+
+
 async def run_l1_discovery(
     client: httpx.AsyncClient,
     query: str,
@@ -566,6 +638,10 @@ async def run_l1_discovery(
         task_map[
             asyncio.create_task(search_anysearch(client, query, limit, settings))
         ] = "anysearch"
+    if settings.has_core:
+        task_map[
+            asyncio.create_task(search_core(client, query, limit, settings))
+        ] = "core_academic"
 
     stage_timeout = timeout if timeout is not None else settings.L1_TIMEOUT_SEC
     done, pending = await asyncio.wait(

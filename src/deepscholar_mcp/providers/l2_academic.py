@@ -173,6 +173,8 @@ async def batch_enrich_openalex(
             "per-page": len(chunk),
             "mailto": settings.OPENALEX_EMAIL,
         }
+        if settings.OPENALEX_API_KEY:
+            params["api_key"] = settings.OPENALEX_API_KEY
 
         try:
             resp = await client.get(url, params=params, timeout=12.0)
