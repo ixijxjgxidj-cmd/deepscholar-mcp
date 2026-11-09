@@ -596,8 +596,12 @@ class DeepScholarPipeline:
                 method_res = "failed"
                 url_res = target_url
 
-                # Priority 1: arXiv HTML rewriting & parsing
-                if ids.arxiv_id:
+                # Priority 1: arXiv HTML rewriting & parsing (unless an explicit direct PDF URL is requested)
+                is_explicit_pdf = (
+                    target_url.lower().endswith(".pdf")
+                    or "arxiv.org/pdf" in target_url.lower()
+                )
+                if ids.arxiv_id and not is_explicit_pdf:
                     md = await fetch_ar5iv_html_markdown(client, ids.arxiv_id)
                     if md:
                         return md, "ar5iv_html", f"https://ar5iv.labs.arxiv.org/html/{ids.arxiv_id}"
