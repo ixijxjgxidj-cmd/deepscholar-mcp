@@ -1,0 +1,1 @@
+"""DeepScholar-MCP test suite."""
