@@ -600,6 +600,10 @@ class DeepScholarPipeline:
                         return md, "ar5iv_html", f"https://ar5iv.labs.arxiv.org/html/{ids.arxiv_id}"
                     else:
                         ar5iv_url = f"https://ar5iv.labs.arxiv.org/html/{ids.arxiv_id}"
+                        # Priority 1b: Exa headless browser page scraping fallback
+                        md = await fetch_via_exa_contents(client, ar5iv_url, self.settings)
+                        if md:
+                            return md, "exa_contents", ar5iv_url
                         md = await fetch_via_cloudflare_browser(client, ar5iv_url, self.settings)
                         if md:
                             return md, "cloudflare_browser", ar5iv_url

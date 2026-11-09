@@ -116,7 +116,7 @@ async def fetch_via_exa_contents(
     url: str,
     settings: Settings,
 ) -> str | None:
-    """Extract clean text content via Exa /contents endpoint."""
+    """Extract clean Markdown/text content via Exa Browser /contents endpoint with livecrawl."""
     if not settings.has_exa:
         return None
 
@@ -126,18 +126,29 @@ async def fetch_via_exa_contents(
         "Content-Type": "application/json",
     }
     payload = {
-        "ids": [url],
+        "urls": [url],
         "text": {
             "maxCharacters": settings.MAX_FULLTEXT_CHARS,
             "includeHtmlTags": False,
         },
+        "livecrawl": "preferred",
+        "livecrawlTimeout": 12000,
     }
 
     try:
         resp = await client.post(api_url, headers=headers, json=payload, timeout=15.0)
         if resp.status_code != 200:
-            logger.warning("Exa contents returned status %d", resp.status_code)
-            return None
+            logger.warning("Exa contents returned status %d: %s", resp.status_code, resp.text[:200])
+            fallback_payload = {
+                "ids": [url],
+                "text": {
+                    "maxCharacters": settings.MAX_FULLTEXT_CHARS,
+                    "includeHtmlTags": False,
+                },
+            }
+            resp = await client.post(api_url, headers=headers, json=fallback_payload, timeout=12.0)
+            if resp.status_code != 200:
+                return None
 
         data: dict[str, Any] = resp.json()
         results = data.get("results", [])
@@ -147,7 +158,7 @@ async def fetch_via_exa_contents(
                 return text
         return None
     except Exception as exc:
-        logger.warning("Exa contents extraction failed for %s: %s", url, exc)
+        logger.warning("Exa browser contents extraction failed for %s: %s", url, exc)
         return None
 
 
