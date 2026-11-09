@@ -229,27 +229,27 @@ async def search_anysearch(
     if not settings.has_anysearch or not settings.ANYSEARCH_API_URL:
         return []
 
-    headers = {}
+    headers = {"Content-Type": "application/json"}
     if settings.ANYSEARCH_API_KEY:
         headers["Authorization"] = f"Bearer {settings.ANYSEARCH_API_KEY}"
 
     hits: list[RawDiscoveryHit] = []
     try:
-        # First attempt GET query
-        params = {"q": query, "format": "json", "limit": limit}
-        resp = await client.get(
+        # First attempt JSON POST query (AnySearch native API format)
+        resp = await client.post(
             settings.ANYSEARCH_API_URL,
             headers=headers,
-            params=params,
+            json={"query": query, "limit": limit},
             timeout=8.0,
         )
 
-        # Fallback to POST on 405 Method Not Allowed
-        if resp.status_code == 405:
-            resp = await client.post(
+        # Fallback to GET on 404/405 (e.g. SearXNG)
+        if resp.status_code in (404, 405):
+            params = {"q": query, "format": "json", "limit": limit}
+            resp = await client.get(
                 settings.ANYSEARCH_API_URL,
                 headers=headers,
-                json={"query": query, "limit": limit},
+                params=params,
                 timeout=8.0,
             )
 
@@ -260,14 +260,28 @@ async def search_anysearch(
             return []
 
         data: dict[str, Any] = resp.json()
-        raw_items = (
-            data.get("results")
-            or data.get("data")
-            or data.get("hits")
-            or []
-        )
-        for idx, item in enumerate(raw_items):
-            title = item.get("title") or ""
+        raw_data = data.get("data")
+        raw_items: list[dict[str, Any]] = []
+        if isinstance(raw_data, dict):
+            raw_items = (
+                raw_data.get("results")
+                or raw_data.get("organic")
+                or raw_data.get("items")
+                or []
+            )
+        elif isinstance(raw_data, list):
+            raw_items = raw_data
+        elif data.get("results") and isinstance(data.get("results"), list):
+            raw_items = data.get("results")
+        elif data.get("hits") and isinstance(data.get("hits"), list):
+            raw_items = data.get("hits")
+
+        for idx, item in enumerate(raw_items[:limit]):
+            if not isinstance(item, dict):
+                continue
+            title = clean_academic_title(item.get("title") or "")
+            if not title:
+                continue
             target_url = item.get("url") or item.get("link") or ""
             snippet = item.get("content") or item.get("snippet") or ""
             pre_ids = extract_identifiers(snippet, target_url)
