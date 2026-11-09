@@ -122,8 +122,34 @@ async def expand_citation_graph(
 
 
 def main() -> None:
-    """Run FastMCP server."""
-    mcp.run()
+    """Run FastMCP server with optional CLI flags for stdio, sse, and streamable-http."""
+    import argparse
+    parser = argparse.ArgumentParser(description="DeepScholar MCP Server")
+    parser.add_argument(
+        "--transport",
+        default="stdio",
+        choices=["stdio", "sse", "streamable-http"],
+        help="MCP transport type (default: stdio)",
+    )
+    parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="Host address to bind for SSE (default: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8001,
+        help="Port to bind for SSE (default: 8001)",
+    )
+    args = parser.parse_args()
+
+    if args.transport == "sse":
+        mcp.run(transport="sse", host=args.host, port=args.port)
+    elif args.transport == "streamable-http":
+        mcp.run(transport="streamable-http", host=args.host, port=args.port)
+    else:
+        mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

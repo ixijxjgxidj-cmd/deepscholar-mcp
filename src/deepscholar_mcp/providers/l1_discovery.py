@@ -3,18 +3,25 @@
 import asyncio
 import logging
 import re
+import urllib.parse
 from typing import Any
 
 import httpx
+from bs4 import BeautifulSoup
 
 from deepscholar_mcp.config import Settings
 from deepscholar_mcp.models import IdentifierSet, RawDiscoveryHit
 from deepscholar_mcp.resolver import (
+    clean_academic_title,
     extract_identifiers,
     reconstruct_openalex_abstract,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class ProviderRateLimitedError(Exception):
+    """Raised when an upstream search provider responds with HTTP 429."""
 
 
 async def search_exa(
@@ -43,8 +50,7 @@ async def search_exa(
     try:
         resp = await client.post(url, headers=headers, json=payload, timeout=8.0)
         if resp.status_code == 429:
-            logger.warning("Exa search rate-limited (HTTP 429)")
-            return []
+            raise ProviderRateLimitedError("Exa rate-limited (HTTP 429)")
         if resp.status_code != 200:
             logger.warning("Exa search error status %d: %s", resp.status_code, resp.text[:200])
             return []
@@ -70,6 +76,8 @@ async def search_exa(
                 )
             )
         return hits
+    except ProviderRateLimitedError:
+        raise
     except Exception as exc:
         logger.warning("Exa search failed: %s", exc)
         return []
@@ -109,8 +117,7 @@ async def search_tavily(
     try:
         resp = await client.post(url, headers=headers, json=payload, timeout=8.0)
         if resp.status_code == 429:
-            logger.warning("Tavily search rate-limited (HTTP 429)")
-            return []
+            raise ProviderRateLimitedError("Tavily rate-limited (HTTP 429)")
         if resp.status_code != 200:
             logger.warning("Tavily search error status %d: %s", resp.status_code, resp.text[:200])
             return []
@@ -134,6 +141,8 @@ async def search_tavily(
                 )
             )
         return hits
+    except ProviderRateLimitedError:
+        raise
     except Exception as exc:
         logger.warning("Tavily search failed: %s", exc)
         return []
@@ -159,8 +168,7 @@ async def search_serper_scholar(
     try:
         resp = await client.post(url, headers=headers, json=payload, timeout=8.0)
         if resp.status_code == 429:
-            logger.warning("Serper Scholar rate-limited (HTTP 429)")
-            return []
+            raise ProviderRateLimitedError("Serper Scholar rate-limited (HTTP 429)")
         if resp.status_code != 200:
             logger.warning("Serper Scholar error status %d: %s", resp.status_code, resp.text[:200])
             return []
@@ -204,6 +212,8 @@ async def search_serper_scholar(
                 )
             )
         return hits
+    except ProviderRateLimitedError:
+        raise
     except Exception as exc:
         logger.warning("Serper Scholar search failed: %s", exc)
         return []
@@ -244,8 +254,7 @@ async def search_anysearch(
             )
 
         if resp.status_code == 429:
-            logger.warning("AnySearch rate-limited (HTTP 429)")
-            return []
+            raise ProviderRateLimitedError("AnySearch rate-limited (HTTP 429)")
         if resp.status_code != 200:
             logger.warning("AnySearch error status %d", resp.status_code)
             return []
@@ -274,6 +283,8 @@ async def search_anysearch(
                 )
             )
         return hits
+    except ProviderRateLimitedError:
+        raise
     except Exception as exc:
         logger.warning("AnySearch failed: %s", exc)
         return []
@@ -296,8 +307,7 @@ async def search_openalex_native(
     try:
         resp = await client.get(url, params=params, timeout=10.0)
         if resp.status_code == 429:
-            logger.warning("OpenAlex native search rate-limited (HTTP 429)")
-            return []
+            raise ProviderRateLimitedError("OpenAlex native search rate-limited (HTTP 429)")
         if resp.status_code != 200:
             logger.warning("OpenAlex search returned status %d", resp.status_code)
             return []
@@ -354,6 +364,8 @@ async def search_openalex_native(
                 )
             )
         return hits
+    except ProviderRateLimitedError:
+        raise
     except Exception as exc:
         logger.warning("OpenAlex native search failed: %s", exc)
         return []
@@ -379,8 +391,7 @@ async def search_s2_native(
     try:
         resp = await client.get(url, params=params, headers=headers, timeout=10.0)
         if resp.status_code == 429:
-            logger.warning("Semantic Scholar native search rate-limited (HTTP 429)")
-            return []
+            raise ProviderRateLimitedError("Semantic Scholar native search rate-limited (HTTP 429)")
         if resp.status_code != 200:
             logger.warning("Semantic Scholar native search returned status %d", resp.status_code)
             return []
@@ -436,8 +447,83 @@ async def search_s2_native(
                 )
             )
         return hits
+    except ProviderRateLimitedError:
+        raise
     except Exception as exc:
         logger.warning("Semantic Scholar native search failed: %s", exc)
+        return []
+
+
+async def search_arxiv_native(
+    client: httpx.AsyncClient,
+    query: str,
+    limit: int,
+    settings: Settings,
+) -> list[RawDiscoveryHit]:
+    """Query arXiv Atom API directly by keyword search (Zero-key baseline)."""
+    encoded_query = urllib.parse.quote(query)
+    url = f"https://export.arxiv.org/api/query?search_query=all:{encoded_query}&start=0&max_results={limit}"
+    try:
+        resp = await client.get(url, timeout=10.0)
+        if resp.status_code == 429:
+            raise ProviderRateLimitedError("arXiv rate-limited (HTTP 429)")
+        if resp.status_code != 200:
+            return []
+        soup = BeautifulSoup(resp.text, "xml")
+        hits: list[RawDiscoveryHit] = []
+        for idx, entry in enumerate(soup.find_all("entry")):
+            id_tag = entry.find("id")
+            if not id_tag:
+                continue
+            entry_id_text = id_tag.text.strip()
+            raw_match = re.search(r"arxiv\.org/abs/([^/]+)$", entry_id_text)
+            matched_id = raw_match.group(1) if raw_match else entry_id_text
+            canonical_id = re.sub(r"v\d+$", "", matched_id)
+
+            title_tag = entry.find("title")
+            raw_title = title_tag.text if title_tag else ""
+            title = clean_academic_title(re.sub(r"\s+", " ", raw_title))
+
+            summary_tag = entry.find("summary")
+            summary = re.sub(r"\s+", " ", summary_tag.text).strip() if summary_tag else ""
+
+            published_tag = entry.find("published")
+            year = None
+            if published_tag and len(published_tag.text) >= 4:
+                year_match = re.match(r"^(\d{4})", published_tag.text)
+                if year_match:
+                    year = int(year_match.group(1))
+
+            authors = [
+                author_tag.find("name").text.strip()
+                for author_tag in entry.find_all("author")
+                if author_tag.find("name")
+            ]
+
+            doi = None
+            doi_tag = entry.find("doi")
+            if doi_tag:
+                doi = doi_tag.text.strip().lower()
+
+            hits.append(
+                RawDiscoveryHit(
+                    title=title,
+                    url=f"https://arxiv.org/abs/{canonical_id}",
+                    snippet=summary,
+                    source_engine="arxiv_native",
+                    authors=authors,
+                    year=year,
+                    venue="arXiv",
+                    oa_pdf_url=f"https://arxiv.org/pdf/{canonical_id}.pdf",
+                    pre_extracted_ids=IdentifierSet(doi=doi, arxiv_id=canonical_id),
+                    rank=idx,
+                )
+            )
+        return hits
+    except ProviderRateLimitedError:
+        raise
+    except Exception as exc:
+        logger.warning("arXiv native search failed: %s", exc)
         return []
 
 
@@ -457,6 +543,9 @@ async def run_l1_discovery(
         asyncio.create_task(
             search_s2_native(client, query, limit, settings)
         ): "semantic_scholar_native",
+        asyncio.create_task(
+            search_arxiv_native(client, query, limit, settings)
+        ): "arxiv_native",
     }
 
     if settings.has_exa:
@@ -493,12 +582,19 @@ async def run_l1_discovery(
         try:
             if task.exception() is not None:
                 exc = task.exception()
-                logger.warning(
-                    "Provider '%s' failed with exception: %s",
-                    provider_name,
-                    exc,
-                )
-                statuses[provider_name] = "failed"
+                if isinstance(exc, ProviderRateLimitedError):
+                    logger.warning(
+                        "Provider '%s' was rate-limited (HTTP 429)",
+                        provider_name,
+                    )
+                    statuses[provider_name] = "rate_limited"
+                else:
+                    logger.warning(
+                        "Provider '%s' failed with exception: %s",
+                        provider_name,
+                        exc,
+                    )
+                    statuses[provider_name] = "failed"
             else:
                 hits = task.result()
                 statuses[provider_name] = "success"
